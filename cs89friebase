@@ -1,0 +1,148 @@
+#include <Wire.h>
+#include <ESP8266WiFi.h>
+#include <FirebaseESP8266.h>  
+#include "MAX30105.h"
+#include "heartRate.h"
+
+MAX30105 particleSensor;
+
+const char* ssid = "اسم_شبكة_WIFI";      
+const char* password = "كلمة_مرور_WIFI";  
+
+#define FIREBASE_HOST "https://your-database.firebaseio.com/"  
+#define FIREBASE_AUTH "YOUR_FIREBASE_SECRET_OR_TOKEN"          
+
+FirebaseData firebaseData;
+
+const byte RATE_SIZE = 4;
+byte rates[RATE_SIZE];
+byte rateSpot = 0;
+long lastBeat = 0;
+
+float beatsPerMinute;
+int beatAvg;
+float spo2;
+
+// Kalman filter parameters
+float Q = 0.1;
+float R_noise = 5;
+float P = 1, K = 0;
+float X_est = 75;
+float X_est_spo2 = 97;
+
+// Kalman filter function
+float kalmanFilter(float measurement, float &X_est, float &P) {
+  P = P + Q;
+  K = P / (P + R_noise);
+  X_est = X_est + K * (measurement - X_est);
+  P = (1 - K) * P;
+  return X_est;
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // الاتصال بشبكة WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected to WiFi");
+
+  // إعداد Firebase
+  Firebase.begin(FIREBASE_HOST, FIREBASE_AUTH);
+  Firebase.reconnectWiFi(true);
+
+  // تهيئة حساس MAX30102
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30102 not connected, please check connections!");
+    while (1);
+  }
+  
+  particleSensor.setup();
+  particleSensor.setPulseAmplitudeRed(0x1F);
+  particleSensor.setPulseAmplitudeIR(0x1F);
+
+  // إعداد حساس ECG (AD8232)
+  pinMode(D5, INPUT);  // استخدم D5 بدلاً من 14
+  pinMode(D6, INPUT);  // استخدم D6 بدلاً من 12
+}
+
+void loop() {
+  // قراءة البيانات من MAX30102
+  long irValue = particleSensor.getIR();
+  long redValue = particleSensor.getRed();
+
+  bool fingerDetected = irValue > 5000;  // التحقق من وجود إصبع
+
+  if (fingerDetected) {
+    if (checkForBeat(irValue)) {
+      long delta = millis() - lastBeat;
+      lastBeat = millis();
+      beatsPerMinute = 60 / (delta / 1000.0);
+
+      if (beatsPerMinute < 255 && beatsPerMinute > 20) {
+        rates[rateSpot++] = (byte)beatsPerMinute;
+        rateSpot %= RATE_SIZE;
+
+        beatAvg = 0;
+        for (byte x = 0 ; x < RATE_SIZE ; x++)
+          beatAvg += rates[x];
+        beatAvg /= RATE_SIZE;
+        
+        beatsPerMinute = kalmanFilter(beatsPerMinute, X_est, P);
+        beatAvg = kalmanFilter(beatAvg, X_est, P);
+      }
+    }
+
+    // حساب SpO₂ بناءً على امتصاص الضوء
+    float ratio = ((float)redValue / irValue);
+    spo2 = 110 - (25 * ratio);
+    spo2 = kalmanFilter(spo2, X_est_spo2, P);
+  } else {
+    beatsPerMinute = 0;
+    beatAvg = 0;
+    spo2 = 0;
+  }
+
+  // قراءة بيانات ECG
+  int ecgValue = analogRead(A0);  // ADC الوحيد في ESP8266 هو A0
+  bool leadOff = (digitalRead(D5) == 1) || (digitalRead(D6) == 1);
+
+  // طباعة البيانات إلى Serial Monitor
+  Serial.print("IR=");
+  Serial.print(irValue);
+  Serial.print(", RED=");
+  Serial.print(redValue);
+
+  if (fingerDetected) {
+    Serial.print(", BPM=");
+    Serial.print(beatsPerMinute);
+    Serial.print(", Avg BPM=");
+    Serial.print(beatAvg);
+    Serial.print(", SpO2=");
+    Serial.print(spo2);
+    Serial.print("%, ECG=");
+    Serial.print(ecgValue);
+  } else {
+    Serial.print(", Finger Not Detected!");
+  }
+
+  if (leadOff) {
+    Serial.print(", Leads Off!");
+  }
+  
+  Serial.println();
+
+  // *إرسال البيانات إلى Firebase*
+  if (fingerDetected) {
+    Firebase.setFloat(firebaseData, "/sensor/BPM", beatsPerMinute);
+    Firebase.setFloat(firebaseData, "/sensor/Avg_BPM", beatAvg);
+    Firebase.setFloat(firebaseData, "/sensor/SpO2", spo2);
+    Firebase.setInt(firebaseData, "/sensor/ECG", ecgValue);
+  }
+
+  delay(1000);  // تأخير لمدة 1 ثانية بين كل تحديث
+}
